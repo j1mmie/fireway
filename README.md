@@ -1,14 +1,17 @@
 # fireway
 A schema migration tool for firestore heavily inspired by [flyway](https://flywaydb.org/)
 
+Main changes from [kevlened/fireway](https://github.com/kevlened/fireway)
+ - Includes dependency upgrades from [Bobbele-Ideas/fireway](https://github.com/Bobbele-Ideas/fireway)
+ - Fixes false-positive "fireway detected open async calls" warnings when using `get` or automatically generated document ids.
+   - Note: This works by overriding the crypto module's `randomBytes` method. I'm not happy with this approach, but I've done what I can to provide a reasonably secure replacement. (See [async-crypto-hack.js](src/async-crypto-hack.js)). 
+ - Fixes --forceWait for tasks that have more than 1 remaining open async call
+ - Adds a 30 second timeout to forceWait. j1mmie/fireway will not wait more than 30 seconds for a single migration to finish.
+
 ## Install
 
 ```bash
-yarn global add fireway
-
-# or 
-
-npx fireway
+npm install "j1mmie/fireway#master"
 ```
 
 ## Credentials
