@@ -1,6 +1,7 @@
 const test = require('tape');
 const firebase = require('@firebase/rules-unit-testing');
 const terminal = require('./console-tester');
+const asyncHooks = require('async_hooks');
 let fireway = require('../');
 
 function wrapper(fn) {
@@ -64,6 +65,69 @@ async function assertData(t, firestore, path, value) {
 
 	t.deepEqual(data, value);
 }
+
+let tsRequired = false
+async function tsMigrate({path: dir, projectId, storageBucket, dryrun, app, debug = false, require: req, forceWait = false} = {}) {
+	var options = {
+		projectId,
+		path: dir,
+		dryrun,
+		app,
+		debug,
+		forceWait
+	}
+
+	if (!tsRequired) {
+		options.require = 'ts-node/register';
+		tsRequired = true;
+	}
+
+	return await fireway.migrate(options);
+}
+
+test('randomBytes should dispatch RANDOMBYTESREQUEST when hack is disabled', t => {
+	const cryptoHack = require('../src/async-crypto-hack');
+	const crypto = require('crypto');
+
+	cryptoHack.disable();
+
+	const hook = asyncHooks.createHook({
+		init: (asyncId, type) => {
+			if (type === 'RANDOMBYTESREQUEST') {
+				t.pass('Received RANDOMBYTESREQUEST hook')
+			}
+		}
+	}).enable()
+
+	crypto.randomBytes(32);
+
+	hook.disable()
+	t.end()
+
+	cryptoHack.enable();
+})
+
+test('randomBytes should not dispatch RANDOMBYTESREQUEST hook or produce duplicates when enabled', t => {
+	const crypto = require('crypto');
+
+	const hook = asyncHooks.createHook({
+		init: (asyncId, type) => {
+			if (type === 'RANDOMBYTESREQUEST') {
+				t.fail('Received RANDOMBYTESREQUEST hook')
+			}
+		}
+	}).enable()
+
+	const randos = []
+	for (let i = 0; i < 100; i++) {
+		randos.push(crypto.randomBytes(32).toString('hex'));
+	}
+
+	hook.disable()
+
+	t.equal(new Set(randos).size, randos.length);
+	t.end();
+});
 
 test('merge: iterative', wrapper(async ({t, projectId, firestore, app}) => {
 	// Empty migration
@@ -406,12 +470,11 @@ test('Delete a field', wrapper(async ({t, projectId, firestore, app}) => {
 	});
 }));
 
-test('TypeScript (run all TS last for perf reasons and only require TS once)', wrapper(async ({t, projectId, firestore, app}) => {
-	const stats = await fireway.migrate({
+test('TypeScript: basic functionality', wrapper(async ({t, projectId, firestore, app}) => {
+	const stats = await tsMigrate({
 		projectId,
 		path: __dirname + '/tsMigration',
-		app,
-		require: 'ts-node/register'
+		app
 	});
 
 	const snapshot = await firestore.collection('fireway').get();
@@ -446,7 +509,7 @@ test('TypeScript (run all TS last for perf reasons and only require TS once)', w
 }));
 
 test('TypeScript: unhandled async warning', wrapper(async ({t, projectId, app}) => {
-	await fireway.migrate({
+	await tsMigrate({
 		projectId,
 		path: __dirname + '/tsOpenTimeoutMigration',
 		app
@@ -459,7 +522,7 @@ test('TypeScript: unhandled async warning', wrapper(async ({t, projectId, app}) 
 }));
 
 test('TypeScript: handle unhandled async', wrapper(async ({t, projectId, app}) => {
-	await fireway.migrate({
+	await tsMigrate({
 		projectId,
 		path: __dirname + '/tsOpenTimeoutMigration',
 		app,
@@ -474,7 +537,7 @@ test('TypeScript: handle unhandled async', wrapper(async ({t, projectId, app}) =
 
 test('TypeScript: handle unhandled async error', wrapper(async ({t, projectId, firestore, app}) => {
 	try {
-		await fireway.migrate({
+		await tsMigrate({
 			projectId,
 			path: __dirname + '/tsOpenTimeoutFailureMigration',
 			app,
@@ -500,4 +563,30 @@ test('TypeScript: handle unhandled async error', wrapper(async ({t, projectId, f
 			version: '0.0.0'
 		});
 	}
+}));
+
+test('TypeScript: awaited get', wrapper(async ({t, projectId, app}) => {
+	await tsMigrate({
+		projectId,
+		path: __dirname + '/tsGetMigration',
+		app,
+	});
+
+	t.equal(
+		terminal.includes('WARNING: fireway detected open async calls'),
+		false
+	);
+}));
+
+test('TypeScript: unawaited get', wrapper(async ({t, projectId, app}) => {
+	await tsMigrate({
+		projectId,
+		path: __dirname + '/tsOpenGetMigration',
+		app,
+	});
+
+	t.equal(
+		terminal.includes('WARNING: fireway detected open async calls'),
+		true
+	);
 }));

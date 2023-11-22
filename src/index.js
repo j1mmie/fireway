@@ -15,6 +15,9 @@ const readdir = util.promisify(fs.readdir);
 const stat = util.promisify(fs.stat);
 const exists = util.promisify(fs.exists);
 
+const cryptoHack = require('./async-crypto-hack')
+cryptoHack.enable()
+
 // Track stats and dryrun setting so we only proxy once.
 // Multiple proxies would create a memory leak.
 const statsMap = new Map();
@@ -96,75 +99,102 @@ function proxyWritableMethods() {
 	});
 }
 
+class HookMetadata {
+	constructor(asyncId, type, call) {
+		this.asyncId = asyncId;
+		this.type    = type;
+		this.call    = call;
+	}
+
+	toString() {
+		return `${this.asyncId} - ${this.type} ${this.call.getFileName()}#${this.call.getFunctionName()} @ ${this.call.getLineNumber()}:${this.call.getColumnNumber()}`;
+	}
+}
 const dontTrack = Symbol('Skip async tracking to short circuit');
 async function trackAsync({log, file, forceWait}, fn) {
-	// Track filenames for async handles
+	// Store metadata about async handles
 	const activeHandles = new Map();
 	const emitter = new EventEmitter();
-	function deleteHandle(id) {
-		if (activeHandles.has(id)) {
-			activeHandles.delete(id);
-			emitter.emit('deleted', id);
+
+	function deleteHandle(asyncId, reason) {
+		const metadata = activeHandles.get(asyncId);
+		if (!metadata) return
+
+		activeHandles.delete(asyncId);
+		emitter.emit('deleted', asyncId);
+
+		if (activeHandles.size !== 0) return
+		emitter.emit('empty');
+	}
+
+	async function waitForAllHandlesToBeDeleted() {
+		const maxWaitTimeSecs = 30;
+		let waitTimeSecs = 0;
+		while (true) {
+			if (activeHandles.size === 0) {
+				return true;
+			}
+
+			waitTimeSecs++;
+			if (waitTimeSecs > maxWaitTimeSecs) {
+				console.log(`Took longer than ${maxWaitTimeSecs} seconds for active handles to be closed. Failing.`)
+				return false
+			}
+
+			console.log(`Waiting one second ${waitTimeSecs} / ${maxWaitTimeSecs} for all handles to close`)
+			await new Promise(r => setTimeout(() => r(), 1000));
 		}
 	}
-	function waitForDeleted() {
-		return new Promise(r => emitter.once('deleted', () => r()));
-	}
+
 	const hook = asyncHooks.createHook({
-		init(asyncId) {
+		init(asyncId, type) {
 			for (const call of callsites()) {
 				// Prevent infinite loops
-				const fn = call.getFunction();
-				if (fn && fn[dontTrack]) {
+				const calledFn = call.getFunction();
+				if (calledFn && calledFn[dontTrack]) {
 					return;
 				}
-				
+
 				const name = call.getFileName();
+
 				if (
 					!name ||
-					name == __filename ||
+					name === __filename ||
+					name.startsWith('node:internal/') ||
 					name.startsWith('internal/') ||
 					name.startsWith('timers.js')
 				) continue;
 
 				if (name === file.path) {
-					const filename = call.getFileName();
-					const lineNumber = call.getLineNumber();
-					const columnNumber = call.getColumnNumber();
-					activeHandles.set(asyncId, `${filename}:${lineNumber}:${columnNumber}`);
+					const metadata = new HookMetadata(asyncId, type, call)
+
+					activeHandles.set(asyncId, metadata);
 					break;
 				}
 			}
 		},
-		before: deleteHandle,
-		after: deleteHandle,
-		promiseResolve: deleteHandle
+		before:         id => deleteHandle(id, 'before'),
+		after:          id => deleteHandle(id, 'after'),
+		promiseResolve: id => deleteHandle(id, 'promiseResolve'),
 	}).enable();
 
-	let logged;
+	function friendlyHandles() {
+		return Array.from(activeHandles.values()).map(h => h.toString());
+	}
+
 	async function handleCheck() {
-		while (activeHandles.size) {
-			if (forceWait) {
-				// NOTE: Attempting to add a timeout requires
-				// shutting down the entire process cleanly.
-				// If someone decides not to return proper
-				// Promises, and provides --forceWait, long
-				// waits are expected.
-				if (!logged) {
-					log('Waiting for async calls to resolve');
-					logged = true;
-				}
-				await waitForDeleted();
-			} else {
-				// This always logs in Node <12
-				const nodeVersion = semver.coerce(process.versions.node);
-				if (nodeVersion.major >= 12) {
-					console.warn(
-						'WARNING: fireway detected open async calls. Use --forceWait if you want to wait:',
-						Array.from(activeHandles.values())
-					);
-				}
-				break;
+		if (activeHandles.size === 0) return;
+		if (forceWait) {
+			console.log('Waiting for async calls to resolve');
+			await waitForAllHandlesToBeDeleted();
+		} else {
+			// This always logs in Node <12
+			const nodeVersion = semver.coerce(process.versions.node);
+			if (nodeVersion.major >= 12) {
+				console.warn(
+					'WARNING: fireway detected open async calls. Use --forceWait if you want to wait:',
+					friendlyHandles()
+				);
 			}
 		}
 	}
@@ -173,7 +203,7 @@ async function trackAsync({log, file, forceWait}, fn) {
 	const unhandled = reason => rejection = reason;
 	process.once('unhandledRejection', unhandled);
 	process.once('uncaughtException', unhandled);
-	
+
 	try {
 		const res = await fn();
 		await handleCheck();
@@ -242,7 +272,7 @@ async function migrate({path: dir, projectId, storageBucket, dryrun, app, debug 
 	let files = filenames.map(filename => {
 		// Skip files that start with a dot
 		if (filename[0] === '.') return;
-		
+
 		const [filenameVersion, description] = filename.split('__');
 		const coerced = semver.coerce(filenameVersion);
 
@@ -286,7 +316,7 @@ async function migrate({path: dir, projectId, storageBucket, dryrun, app, debug 
 	if (!storageBucket && projectId) {
 		storageBucket = `${projectId}.appspot.com`;
 	}
-	
+
 	const providedApp = app;
 	if (!app) {
 		app = admin.initializeApp({
@@ -330,7 +360,7 @@ async function migrate({path: dir, projectId, storageBucket, dryrun, app, debug 
 	for (const file of files) {
 		stats.executedFiles += 1;
 		log('Running', file.filename);
-		
+
 		let migration;
 		try {
 			migration = require(file.path);
